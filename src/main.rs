@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use diesel::{Connection, SqliteConnection};
+use clap::Parser;
+use diesel::SqliteConnection;
 use paho_mqtt::{self as mqtt, AsyncClient, AsyncReceiver, DisconnectOptionsBuilder, Message};
 use serde::{Deserialize, Serialize};
 use tokio;
@@ -118,7 +119,7 @@ pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSett
     println!("Starting MQTT listener thread.");
 
     let uuid_string = Uuid::new_v4().to_string();
-    let client_id = format!("mqtt_logger-{}", uuid_string);
+    let client_id = format!("glowmarkt_logger-{}", uuid_string);
     println!("Generated Client ID: {}", client_id);
 
     let mut client_and_stream: Option<(AsyncClient, AsyncReceiver<Option<Message>>)> = None;
@@ -158,15 +159,10 @@ pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSett
                     match serde_json::from_str::<ElectricityMeterMessage>(&msg.payload_str()) {
                         Ok(data) => {
                             println!("Deserialized data: {:?}", data);
-                            // Now you can work with the structured 'data' object
 
                             if let Err(err) = insert_electricity_meter_message(conn, &data).await {
                                 println!("Unexpected error during DB insert: {}", err);
                             }
-
-                            // if let Err(err) = emit_event("electricityUpdate", data) {
-                              //  println!("Unexpected error emitting electricityUpdate event: {}", err);
-                           // }
                         }
                         Err(e) => {
                             println!("Failed to deserialize payload: {}", e);
@@ -178,29 +174,44 @@ pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSett
     }
 }
 
-async fn disconnect_client(client: &AsyncClient) {
-    let opts = DisconnectOptionsBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .finalize();
+/// A program for capturing and storing in a SQLite database MQTT messages published from a Glowmarkt CAD device
+#[derive(Parser)]
+#[clap(author, version, about)]
+struct Args {
+    /// The path to the SQLite database to store data to
+    #[clap(short, long)]
+    database: String,
 
-    match client.disconnect(Some(opts)).await {
-        Ok(_) => println!("Successfully disconnected MQTT client."),
-        Err(e) => println!("Error during MQTT client disconnect: {:?}", e),
-    }
+    /// The address of the MQTT message broker to connect to
+    #[clap(short, long)]
+    broker: String,
+
+    /// The electricity topic that the messages are published to
+    #[clap(short, long)]
+    topic: String,
+
+    /// The username to connect to the MQTT broker with
+    #[clap(short, long)]
+    username: String,
+
+    /// The password to connect to the MQTT broker with
+    #[clap(short, long)]
+    password: String,
 }
 
 #[tokio::main]
 async fn main() {
-    let mut connection = db::establish_connection("./glowmarkt.db");
+    let args = Args::parse();
+
+    let mut connection = db::establish_connection(&args.database);
 
     db::run_migrations(&mut connection);
 
-    // TODO: take these parameters from env vars or args
     let settings = MqttSettings {
-        hostname: "".into(),
-        topic: "".into(),
-        username: "".into(),
-        password: "".into(),
+        hostname: args.broker,
+        topic: args.topic,
+        username: args.username,
+        password: args.password,
     };
 
     start_mqtt_listener(&mut connection, settings).await;
