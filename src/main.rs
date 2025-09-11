@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::operations::insert_electricity_meter_message;
 
+mod db;
 mod models;
 mod operations;
 mod schema;
@@ -188,14 +189,11 @@ async fn disconnect_client(client: &AsyncClient) {
     }
 }
 
-fn establish_connection() -> SqliteConnection {
-    let database_url = "./glowmarkt.db".to_string();
-    SqliteConnection::establish(&database_url).expect("Error connecting to database")
-}
-
 #[tokio::main]
 async fn main() {
-    let mut connection = establish_connection();
+    let mut connection = db::establish_connection("./glowmarkt.db");
+
+    db::run_migrations(&mut connection);
 
     // TODO: take these parameters from env vars or args
     let settings = MqttSettings {
