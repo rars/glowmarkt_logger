@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use clap::Parser;
-use diesel::SqliteConnection;
-use paho_mqtt::{self as mqtt, AsyncClient, AsyncReceiver, DisconnectOptionsBuilder, Message};
+use paho_mqtt::{self as mqtt, AsyncClient, AsyncReceiver, Message};
 use serde::{Deserialize, Serialize};
 use tokio;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::db::DbPool;
 use crate::operations::insert_electricity_meter_message;
 
 mod db;
@@ -115,7 +115,7 @@ async fn create_mqtt_client(
     Ok(client)
 }
 
-pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSettings) {
+pub async fn start_mqtt_listener(pool: DbPool, settings: MqttSettings) {
     println!("Starting MQTT listener thread.");
 
     let uuid_string = Uuid::new_v4().to_string();
@@ -125,7 +125,7 @@ pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSett
     let mut client_and_stream: Option<(AsyncClient, AsyncReceiver<Option<Message>>)> = None;
 
     loop {
-        let (client, stream) = match client_and_stream.as_mut() {
+        let (_client, stream) = match client_and_stream.as_mut() {
             Some((c, s)) => (c, s),
             None => {
                 if settings.is_complete() {
@@ -160,8 +160,23 @@ pub async fn start_mqtt_listener(conn: &mut SqliteConnection, settings: MqttSett
                         Ok(data) => {
                             println!("Deserialized data: {:?}", data);
 
-                            if let Err(err) = insert_electricity_meter_message(conn, &data).await {
-                                println!("Unexpected error during DB insert: {}", err);
+                            let mut conn = match pool.get() {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    println!("Failed to get DB connection from pool: {}", err);
+                                    continue;
+                                }
+                            };
+
+                            match insert_electricity_meter_message(&mut conn, &data).await {
+                                Ok(inserted) => {
+                                    if inserted {
+                                        println!("Inserted data into DB");
+                                    }
+                                }
+                                Err(err) => {
+                                    println!("Unexpected error during DB insert: {}", err);
+                                }
                             }
                         }
                         Err(e) => {
@@ -203,9 +218,9 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let mut connection = db::establish_connection(&args.database);
+    let pool = db::create_pool(&args.database).expect("Failed to create DB pool");
 
-    db::run_migrations(&mut connection);
+    db::run_migrations(&pool).expect("Failed to run DB migrations");
 
     let settings = MqttSettings {
         hostname: args.broker,
@@ -214,5 +229,29 @@ async fn main() {
         password: args.password,
     };
 
-    start_mqtt_listener(&mut connection, settings).await;
+    let checkpoint_pool = pool.clone();
+    tokio::spawn(async move {
+        start_checkpoint_listener(checkpoint_pool).await;
+    });
+
+    start_mqtt_listener(pool, settings).await;
+}
+
+pub async fn start_checkpoint_listener(pool: DbPool) {
+    println!("Starting checkpoint listener thread.");
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        println!("Triggering WAL checkpoint.");
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(err) => {
+                println!("Failed to get DB connection from pool for checkpoint: {}", err);
+                continue;
+            }
+        };
+        use diesel::connection::SimpleConnection;
+        if let Err(err) = conn.batch_execute("PRAGMA wal_checkpoint(TRUNCATE);") {
+            println!("Failed to trigger WAL checkpoint: {}", err);
+        }
+    }
 }

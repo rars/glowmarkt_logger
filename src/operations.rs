@@ -1,17 +1,44 @@
-use chrono::NaiveDateTime;
-use diesel::sql_types::Integer;
-use diesel::{Connection, SqliteConnection};
-
+use chrono::{NaiveDateTime, ParseError};
 use diesel::prelude::*;
+use diesel::sql_types::Integer;
+use std::fmt;
 
+use crate::db::DbConnection;
 use crate::models::{self, ElectricityMeterMessage};
 
-// type RepositoryResult<T> = Result<T, RepositoryError>;
+#[derive(Debug)]
+pub enum InsertError {
+    DbError(diesel::result::Error),
+    TimeParseError(ParseError),
+}
+
+impl fmt::Display for InsertError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            InsertError::DbError(ref err) => write!(f, "Database Error: {}", err),
+            InsertError::TimeParseError(ref err) => write!(f, "Timestamp Parse Error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for InsertError {}
+
+impl From<diesel::result::Error> for InsertError {
+    fn from(err: diesel::result::Error) -> InsertError {
+        InsertError::DbError(err)
+    }
+}
+
+impl From<ParseError> for InsertError {
+    fn from(err: ParseError) -> InsertError {
+        InsertError::TimeParseError(err)
+    }
+}
 
 pub async fn insert_electricity_meter_message(
-    conn: &mut SqliteConnection,
+    conn: &mut DbConnection,
     message: &crate::ElectricityMeterMessage,
-) -> Result<(), diesel::result::Error> {
+) -> Result<bool, InsertError> {
     use crate::schema::electricity_meter_messages::dsl::*;
     use crate::schema::energy_export_data::dsl::*;
     use crate::schema::energy_import_data::dsl::*;
@@ -21,10 +48,24 @@ pub async fn insert_electricity_meter_message(
 
     let format = "%Y-%m-%dT%H:%M:%SZ";
 
-    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+    conn.transaction::<_, InsertError, _>(|conn| {
+        let parsed_timestamp = NaiveDateTime::parse_from_str(&message_contents.timestamp, format)?;
+
+        let existing_message = electricity_meter_messages
+            .filter(timestamp.eq(parsed_timestamp))
+            .first::<models::ElectricityMeterMessage>(conn)
+            .optional()?;
+
+        if existing_message.is_some() {
+            println!(
+                "Skipping duplicate message with timestamp: {}",
+                &message_contents.timestamp
+            );
+            return Ok(false);
+        }
+
         let emm = models::NewElectricityMeterMessage {
-            timestamp: NaiveDateTime::parse_from_str(&message_contents.timestamp, format)
-                .expect("parsed"),
+            timestamp: parsed_timestamp,
         };
 
         diesel::insert_into(electricity_meter_messages)
@@ -84,8 +125,6 @@ pub async fn insert_electricity_meter_message(
             .values(&power)
             .execute(conn)?;
 
-        Ok(())
-    })?;
-
-    Ok(())
+        Ok(true)
+    })
 }
